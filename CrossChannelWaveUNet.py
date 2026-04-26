@@ -96,7 +96,6 @@ class CrossChannelWaveUNet(nn.Module):
         )
 
         # ===== Decoder =====
-        # ===== Decoder =====
         decoder_in = []
         decoder_out = []
 
@@ -142,7 +141,7 @@ class CrossChannelWaveUNet(nn.Module):
             # attention
             a1, a2 = self.attn[i](x1, x2)
 
-            # 保存 skip（拼接两个通道）
+            # concat
             skip = torch.cat([a1, a2], dim=1)
             skips.append(skip)
 
@@ -160,7 +159,7 @@ class CrossChannelWaveUNet(nn.Module):
 
             skip = skips[self.n_layers - i - 1]
 
-            # 对齐长度
+            # Align lengths
             if o.size(-1) != skip.size(-1):
                 min_len = min(o.size(-1), skip.size(-1))
                 o = o[..., :min_len]
@@ -170,7 +169,7 @@ class CrossChannelWaveUNet(nn.Module):
             o = self.decoder[i](o)
 
         # ===== Output =====
-        # 使用第一个通道作为 reference（论文隐含设定）
+        # Use the first channel as reference (implied by the paper)
         ref = x[:, 0:1, :]
         if o.size(-1) != ref.size(-1):
             o = F.interpolate(o, size=ref.size(-1), mode="linear", align_corners=True)
