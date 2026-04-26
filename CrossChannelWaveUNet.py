@@ -4,39 +4,32 @@ import torch.nn.functional as F
 
 
 class LearnableSigmoid(nn.Module):
-    def __init__(self, init_alpha=1.0, init_beta=0.0):
+    def __init__(self):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(init_alpha))
-        self.beta = nn.Parameter(torch.tensor(init_beta))
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         return torch.sigmoid(self.alpha * (x - self.beta))
 
 
 class CrossChannelAttention(nn.Module):
-    """
-    Input:
-        x1, x2: [B, C, T]
-    Output:
-        a1, a2: [B, C, T]
-    """
     def __init__(self, channels):
         super().__init__()
-        self.proj1 = nn.Conv1d(channels, channels, kernel_size=1)
-        self.proj2 = nn.Conv1d(channels, channels, kernel_size=1)
+        self.conv1 = nn.Conv1d(channels, channels, 1)
+        self.conv2 = nn.Conv1d(channels, channels, 1)
+        self.conv_mask = nn.Conv1d(channels, channels, 1)
 
-        self.learnable_sigmoid = LearnableSigmoid()
-
-        self.mask_proj = nn.Conv1d(channels, channels, kernel_size=1)
+        self.sigmoid = LearnableSigmoid()
 
     def forward(self, x1, x2):
-        h1 = torch.tanh(self.proj1(x1))
-        h2 = torch.tanh(self.proj2(x2))
+        h1 = torch.tanh(self.conv1(x1))
+        h2 = torch.tanh(self.conv2(x2))
 
         z = torch.abs(h1 * h2)
-        z = self.learnable_sigmoid(z)
+        z = self.sigmoid(z)
 
-        mask = torch.sigmoid(self.mask_proj(z))
+        mask = torch.sigmoid(self.conv_mask(z))
 
         a1 = x1 + mask * x1
         a2 = x2 + mask * x2
@@ -44,190 +37,149 @@ class CrossChannelAttention(nn.Module):
         return a1, a2
 
 
-class DownBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=15):
+class DownSamplingLayer(nn.Module):
+    def __init__(self, channel_in, channel_out):
         super().__init__()
-        pad = kernel_size // 2
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad)
-        self.act = nn.LeakyReLU(0.2, inplace=True)
-
-    def forward(self, x):
-        x = self.act(self.conv(x))
-        skip = x
-        x = F.avg_pool1d(x, kernel_size=2, stride=2)
-        return x, skip
-
-
-class UpBlock(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch, kernel_size=5):
-        super().__init__()
-        pad = kernel_size // 2
-
-        self.skip_fuse = nn.Conv1d(skip_ch, out_ch, kernel_size=1)
-
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_ch + out_ch, out_ch, kernel_size, padding=pad),
-            nn.LeakyReLU(0.2, inplace=True),
+        self.main = nn.Sequential(
+            nn.Conv1d(channel_in, channel_out, kernel_size=15, padding=7),
+            nn.BatchNorm1d(channel_out),
+            nn.LeakyReLU(0.1)
         )
 
-    def forward(self, x, skip):
-        x = F.interpolate(x, scale_factor=2, mode="linear", align_corners=False)
-
-        if x.size(-1) != skip.size(-1):
-            min_len = min(x.size(-1), skip.size(-1))
-            x = x[..., :min_len]
-            skip = skip[..., :min_len]
-
-        skip = self.skip_fuse(skip)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+    def forward(self, x):
+        return self.main(x)
 
 
-class ChannelEncoder(nn.Module):
-    def __init__(self, num_layers=10, base_ch=24):
+class UpSamplingLayer(nn.Module):
+    def __init__(self, channel_in, channel_out):
         super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv1d(channel_in, channel_out, kernel_size=5, padding=2),
+            nn.BatchNorm1d(channel_out),
+            nn.LeakyReLU(0.1)
+        )
 
-        blocks = []
-        in_ch = 1
-
-        for l in range(1, num_layers + 1):
-            out_ch = base_ch * l
-            blocks.append(DownBlock(in_ch, out_ch, kernel_size=15))
-            in_ch = out_ch
-
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward_one_layer(self, x, idx):
-        return self.blocks[idx](x)
+    def forward(self, x):
+        return self.main(x)
 
 
 class CrossChannelWaveUNet(nn.Module):
-    """
-    Proposed model approximation from Ho et al. 2020.
-
-    Input:
-        noisy: [B, 2, T]
-    Output:
-        enhanced: [B, 1, T]
-    """
-    def __init__(
-        self,
-        input_len=16384,
-        num_layers=10,
-        base_ch=24,
-        bottleneck_ch=264,
-    ):
+    def __init__(self, n_layers=10, channels_interval=24):
         super().__init__()
 
-        self.input_len = input_len
-        self.num_layers = num_layers
-        self.base_ch = base_ch
+        self.n_layers = n_layers
+        self.channels_interval = channels_interval
 
-        self.encoder1 = ChannelEncoder(num_layers, base_ch)
-        self.encoder2 = ChannelEncoder(num_layers, base_ch)
+        # ===== Encoder (two branches) =====
+        encoder_in = [1] + [i * channels_interval for i in range(1, n_layers)]
+        encoder_out = [i * channels_interval for i in range(1, n_layers + 1)]
 
-        self.attn_blocks = nn.ModuleList([
-            CrossChannelAttention(base_ch * l)
-            for l in range(1, num_layers + 1)
+        self.encoder1 = nn.ModuleList()
+        self.encoder2 = nn.ModuleList()
+
+        for i in range(n_layers):
+            self.encoder1.append(DownSamplingLayer(encoder_in[i], encoder_out[i]))
+            self.encoder2.append(DownSamplingLayer(encoder_in[i], encoder_out[i]))
+
+        # ===== Attention =====
+        self.attn = nn.ModuleList([
+            CrossChannelAttention(encoder_out[i])
+            for i in range(n_layers)
         ])
 
-        last_ch = base_ch * num_layers
-
-        self.bottleneck = nn.Sequential(
-            nn.Conv1d(last_ch * 2, bottleneck_ch, kernel_size=15, padding=7),
-            nn.LeakyReLU(0.2, inplace=True),
+        # ===== Bottleneck =====
+        bottleneck_ch = n_layers * channels_interval
+        self.middle = nn.Sequential(
+            nn.Conv1d(2 * bottleneck_ch, bottleneck_ch, kernel_size=15, padding=7),
+            nn.BatchNorm1d(bottleneck_ch),
+            nn.LeakyReLU(0.1)
         )
 
-        up_blocks = []
-        in_ch = bottleneck_ch
+        # ===== Decoder =====
+        # ===== Decoder =====
+        decoder_in = []
+        decoder_out = []
 
-        for l in range(num_layers, 0, -1):
-            skip_ch = base_ch * l * 2
-            out_ch = base_ch * l
-            up_blocks.append(UpBlock(in_ch, skip_ch, out_ch, kernel_size=5))
-            in_ch = out_ch
+        bottleneck_ch = n_layers * channels_interval
 
-        self.decoder = nn.ModuleList(up_blocks)
+        for l in range(n_layers, 0, -1):
+            enc_ch = l * channels_interval
 
-        self.out_conv = nn.Conv1d(base_ch, 1, kernel_size=1)
+            if l == n_layers:
+                in_ch = bottleneck_ch + 2 * enc_ch
+            else:
+                prev_ch = (l + 1) * channels_interval
+                in_ch = prev_ch + 2 * enc_ch
+
+            decoder_in.append(in_ch)
+            decoder_out.append(enc_ch)
+
+        self.decoder = nn.ModuleList([
+            UpSamplingLayer(decoder_in[i], decoder_out[i])
+            for i in range(n_layers)
+        ])
+
+        # ===== Output =====
+        self.out = nn.Sequential(
+            nn.Conv1d(1 + channels_interval, 1, kernel_size=1),
+            nn.Tanh()
+        )
 
     def forward(self, x):
-        assert x.dim() == 3, "Input must be [B, 2, T]"
-        assert x.size(1) == 2, "This implementation expects 2-channel input"
-
+        """
+        x: [B, 2, T]
+        """
         x1 = x[:, 0:1, :]
         x2 = x[:, 1:2, :]
 
         skips = []
 
-        for i in range(self.num_layers):
-            x1, s1 = self.encoder1.forward_one_layer(x1, i)
-            x2, s2 = self.encoder2.forward_one_layer(x2, i)
+        # ===== Encoder =====
+        for i in range(self.n_layers):
+            x1 = self.encoder1[i](x1)
+            x2 = self.encoder2[i](x2)
 
-            a1, a2 = self.attn_blocks[i](s1, s2)
+            # attention
+            a1, a2 = self.attn[i](x1, x2)
 
-            # cross-concat: A1 concat to X2, A2 concat to X1
-            skip = torch.cat([torch.cat([s1, a2], dim=1),
-                              torch.cat([s2, a1], dim=1)], dim=1)
-
-            # 上面会变成 4C，参数量偏大。
-            # 更贴近论文 decoder skip 的做法是只保留双路 encoder 特征：
+            # 保存 skip（拼接两个通道）
             skip = torch.cat([a1, a2], dim=1)
-
             skips.append(skip)
 
-        z = torch.cat([x1, x2], dim=1)
-        z = self.bottleneck(z)
+            # downsample
+            x1 = x1[:, :, ::2]
+            x2 = x2[:, :, ::2]
 
-        for up, skip in zip(self.decoder, reversed(skips)):
-            z = up(z, skip)
+        # ===== Bottleneck =====
+        o = torch.cat([x1, x2], dim=1)
+        o = self.middle(o)
 
-        y = self.out_conv(z)
+        # ===== Decoder =====
+        for i in range(self.n_layers):
+            o = F.interpolate(o, scale_factor=2, mode="linear", align_corners=True)
 
-        if y.size(-1) != x.size(-1):
-            y = F.interpolate(y, size=x.size(-1), mode="linear", align_corners=False)
+            skip = skips[self.n_layers - i - 1]
 
-        return y
+            # 对齐长度
+            if o.size(-1) != skip.size(-1):
+                min_len = min(o.size(-1), skip.size(-1))
+                o = o[..., :min_len]
+                skip = skip[..., :min_len]
 
+            o = torch.cat([o, skip], dim=1)
+            o = self.decoder[i](o)
 
-def negative_sisdr(est, ref, eps=1e-8):
-    """
-    est/ref: [B, 1, T]
-    """
-    est = est - est.mean(dim=-1, keepdim=True)
-    ref = ref - ref.mean(dim=-1, keepdim=True)
+        # ===== Output =====
+        # 使用第一个通道作为 reference（论文隐含设定）
+        ref = x[:, 0:1, :]
+        if o.size(-1) != ref.size(-1):
+            o = F.interpolate(o, size=ref.size(-1), mode="linear", align_corners=True)
 
-    proj = torch.sum(est * ref, dim=-1, keepdim=True) * ref
-    proj = proj / (torch.sum(ref ** 2, dim=-1, keepdim=True) + eps)
+        o = torch.cat([o, ref], dim=1)
+        o = self.out(o)
 
-    noise = est - proj
-
-    ratio = torch.sum(proj ** 2, dim=-1) / (torch.sum(noise ** 2, dim=-1) + eps)
-    sisdr = 10 * torch.log10(ratio + eps)
-
-    return -sisdr.mean()
-
-
-def wsdr_loss(est, clean, noisy_ref, eps=1e-8):
-    """
-    Weighted SDR loss approximation used in speech enhancement papers.
-
-    est:       [B, 1, T]
-    clean:     [B, 1, T]
-    noisy_ref: [B, 1, T], usually mic-1 noisy signal
-    """
-    noise = noisy_ref - clean
-    est_noise = noisy_ref - est
-
-    clean_energy = torch.sum(clean ** 2, dim=-1)
-    noise_energy = torch.sum(noise ** 2, dim=-1)
-
-    alpha = clean_energy / (clean_energy + noise_energy + eps)
-    alpha = alpha.mean()
-
-    return alpha * negative_sisdr(est, clean) + (1 - alpha) * negative_sisdr(est_noise, noise)
-
-
+        return o
+    
 if __name__ == "__main__":
     from ptflops import get_model_complexity_info
     model = CrossChannelWaveUNet()
@@ -239,14 +191,4 @@ if __name__ == "__main__":
 
     macs, params = get_model_complexity_info(model,(2, 16384),print_per_layer_stat=False,as_strings=True)
     print(f"macs: {macs}, params: {params}")
-    # macs: 4.1 GMac, params: 11.1 M
-
-
-
-    clean = torch.randn(4, 1, 16384)
-    noisy_ref = x[:, 0:1, :]
-
-    loss = wsdr_loss(y, clean, noisy_ref)
-    loss.backward()
-
-    print("loss:", loss.item())
+    # macs: 4.43 GMac, params: 11.57 M
